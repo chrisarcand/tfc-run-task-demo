@@ -1,20 +1,17 @@
 package main
 
 import (
-	"archive/tar"
-	"bufio"
 	"bytes"
-	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/go-tfe"
 )
 
 type PrePlanPayload struct {
@@ -60,10 +57,17 @@ type ResultAttributes struct {
 // Queue to store the jobs (JSON payloads)
 var jobQueue = make(chan PrePlanPayload, 100)
 
+var restrictedCredentialKeys = map[string]struct{}{
+	"AWS_ACCESS_KEY_ID":      struct{}{},
+	"AWS_SECRET_ACCESS_KEY":  struct{}{},
+	"AWS_SESSION_EXPIRATION": struct{}{},
+	"AWS_SESSION_TOKEN":      struct{}{},
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Check if the request method is POST
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.Method != http.MethodPost || r.UserAgent() != "TFC/1.0 (+https://app.terraform.io; TFC)" {
+		http.Error(w, "You aren't a TFC Run Task, go away", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -72,8 +76,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	// log.Printf("Received payload: %s\n", string(body))
 
 	// Parse the JSON payload
 	var payload PrePlanPayload
@@ -93,8 +95,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	tfeClient, err := tfe.NewClient(nil) // Use defaults
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Start the job processor in a separate goroutine
-	go processJobs()
+	go processJobs(tfeClient)
 
 	// Define the HTTP handler function
 	http.HandleFunc("/", handleRequest)
@@ -102,131 +109,6 @@ func main() {
 	// Start the server on port 80
 	log.Println("Server listening on port 80...")
 	log.Fatal(http.ListenAndServe(":80", nil))
-}
-
-// downloadTarGz downloads a tar.gz file from the specified URL and extracts its contents.
-//
-// It takes a URL as a parameter and returns an error if any error occurs during the download or extraction process.
-// The function creates a temporary file to store the downloaded tar.gz file, sends a GET request to download the file,
-// copies the response body to the temporary file, opens the downloaded tar.gz file for reading, creates a reader for
-// the gzip file, and extracts files from the tar archive. It returns nil if the process is successful.
-func downloadConfigVersion(url, token, filename string) error {
-	// Create a new HTTP request with the provided URL
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-
-	// Add the token to the request header
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/vnd.api+json")
-
-	// Send the request
-	resp, err := http.DefaultClient.Do(req)
-
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Check if the response status code is 200 OK
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("request failed with status code: %d", resp.StatusCode)
-	}
-
-	// Create a temporary file to store the downloaded tar.gz file
-	tempFile, err := os.Create(filename + ".tar.gz")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tempFile.Name())
-
-	// Copy the response body to the temporary file
-	_, err = io.Copy(tempFile, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	// Close the temporary file
-	err = tempFile.Close()
-	if err != nil {
-		return err
-	}
-	log.Println("download OK")
-
-	err = extractTarGz(tempFile.Name(), "./"+filename)
-	if err != nil {
-		return err
-	} else {
-		log.Println("File extracted OK")
-	}
-
-	return nil
-}
-
-func extractTarGz(tarGzFile, destination string) error {
-	// Open the tar.gz file for reading
-	file, err := os.Open(tarGzFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Create a gzip reader for the file
-	gzipReader, err := gzip.NewReader(file)
-	if err != nil {
-		return err
-	}
-	defer gzipReader.Close()
-
-	// Create a tar reader for the gzip reader
-	tarReader := tar.NewReader(gzipReader)
-
-	// Extract files from the tar archive
-	for {
-		header, err := tarReader.Next()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-
-		// Extract the file to the specified destination
-		target := filepath.Join(destination, header.Name)
-
-		// Check the type of entry
-		switch header.Typeflag {
-		case tar.TypeDir:
-			// Create directory if it doesn't exist
-			err = os.MkdirAll(target, os.ModePerm)
-			if err != nil {
-				return err
-			}
-
-		case tar.TypeReg:
-			// Create the file and copy contents
-			err = os.MkdirAll(filepath.Dir(target), os.ModePerm)
-			if err != nil {
-				return err
-			}
-
-			file, err := os.Create(target)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-
-			if _, err := io.Copy(file, tarReader); err != nil {
-				return err
-			}
-
-		default:
-			return fmt.Errorf("unsupported file type: %v in %s", header.Typeflag, header.Name)
-		}
-	}
-
-	return nil
 }
 
 func sendPatchRequest(url string, payload []byte, authToken string) error {
@@ -263,47 +145,28 @@ func sendPatchRequest(url string, payload []byte, authToken string) error {
 	return nil
 }
 
-func processJobs() {
+func processJobs(tfeClient *tfe.Client) {
 	for payload := range jobQueue {
-		// Lock the job queue
-		// jobQueue.Lock()
+		log.Printf("Processing job for run: %+v\n", payload.RunID)
 
-		// Check if there are any jobs in the queue
-		// if len(jobQueue.PrePlanPayloads) > 0 {
-		// Retrieve the first job from the queue
-		// payload := jobQueue.PrePlanPayloads[0]
-		// jobQueue.PrePlanPayloads = jobQueue.PrePlanPayloads[1:]
-
-		log.Printf("Processing job: %+v\n", payload.RunID)
-		// Add your job processing logic here
-
-		err := downloadConfigVersion(payload.ConfigurationVersionDownloadURL, payload.AccessToken, payload.RunID)
+		workspaceVars, err := tfeClient.Variables.List(context.Background(), payload.WorkspaceID, nil)
 		if err != nil {
 			log.Println(err.Error())
 		}
 
-		patternsFile := "patternsFile.txt"
-		patterns, err := readRegexPatterns(patternsFile)
-		if err != nil {
-			log.Fatal(err)
-		}
+		var foundKeys []string
 
-		matchCounts := runRegexOnFolder(payload.RunID, patterns)
-		err = os.RemoveAll("./" + payload.RunID)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		if len(matchCounts) > 0 && err == nil {
-			var message strings.Builder
-			for pattern, count := range matchCounts {
-				if count > 0 {
-					message.WriteString(fmt.Sprintf("Pattern: %s, Matches: %d\n", pattern, count))
-				}
+		for _, variable := range workspaceVars.Items {
+			if _, ok := restrictedCredentialKeys[variable.Key]; ok {
+				foundKeys = append(foundKeys, variable.Key)
 			}
+		}
 
-			log.Println(message.String())
-			result := createFailedResult(message.String())
+		if len(foundKeys) != 0 {
+			log.Println("Looks like someone accidentally set their own AWS creds! Let's steer them in the right direction...")
+			message := fmt.Sprintf(`
+This workspace appears to have AWS credential variables set on it. AWS credentials are managed on your behalf by the Platform Engineering team. These must be removed immediately to ensure compliance: %s. Go to the "Variables" page in the left side nav and remove these variables, then start another run. If you have any questions, feel free to reach out to platform@mycoolcompany.com. Thanks! `, strings.Join(foundKeys, ", "))
+			result := createFailedResult(message)
 			jsonData, err := json.Marshal(result)
 			if err != nil {
 				log.Println(err.Error())
@@ -315,7 +178,7 @@ func processJobs() {
 			}
 
 		} else {
-			result := createPassedResult("Configured patterns not found")
+			result := createPassedResult("No erroenous credentials set on this workspace. Good job! --Platform Engineering Team")
 			jsonData, err := json.Marshal(result)
 			if err != nil {
 				log.Println(err.Error())
@@ -326,10 +189,8 @@ func processJobs() {
 				log.Println(err.Error())
 			}
 		}
-		// }
 
-		// Unlock the job queue
-		// jobQueue.Unlock()
+		log.Println("Job complete for run: %s", payload.RunID)
 
 		// Sleep for some time before checking for the next job
 		time.Sleep(1 * time.Second)
@@ -359,72 +220,4 @@ func createFailedResult(message string) Result {
 			},
 		},
 	}
-}
-
-func runRegexOnFolder(folderPath string, regexPatterns []string) map[string]int {
-	matchCounts := make(map[string]int)
-
-	// Traverse each file in the folder
-	err := filepath.Walk(folderPath, func(filePath string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-
-		// Read the file content
-		content, err := os.ReadFile(filePath)
-		if err != nil {
-			return err
-		}
-
-		// Match each regular expression against the file content
-		for _, pattern := range regexPatterns {
-			regex, err := regexp.Compile(pattern)
-			if err != nil {
-				log.Printf("Error compiling regex pattern: %s\n", pattern)
-				continue
-			}
-
-			matches := regex.FindAll(content, -1)
-			if matches != nil {
-				matchCounts[pattern] += len(matches)
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return matchCounts
-}
-
-func readRegexPatterns(filePath string) ([]string, error) {
-	patterns := []string{}
-
-	// Open the file
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	// Read the file line by line
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		pattern := scanner.Text()
-		patterns = append(patterns, pattern)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return patterns, nil
 }
